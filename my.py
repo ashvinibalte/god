@@ -1,191 +1,127 @@
-# chat/ai/graphs/search.py
+# tachyon/vector_store.py
 from __future__ import annotations
 
-import os
-from urllib.parse import urlparse
-from typing import Any, Dict, List, Optional
+import json
+import logging
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
 
-import pandas as pd
+logger = logging.getLogger(__name__)
 
-# -------------------------------------------------------------------
-# Normalization helpers: rename fields, coalesce missing values,
-# and compose a human-friendly "reference" string for display.
-# -------------------------------------------------------------------
+# NOTE: This module assumes you already have:
+#   - Config.tachyon.search_url
+#   - Config.tachyon.collection_id
+#   - Config.tachyon.timeout
+#   - TachyonVS.get_headers()
+#   - TachyonVS._make_async_request(url, payload_str, headers, timeout)
+#   - TachyonVS._as_search_results(resp_json, **kwargs)
+# If your names differ, adjust the references below.
 
-_RENAME = {
-    "title": "document_name",
-    "hyperlink": "document_link",
-    "sectionTitle": "section_name",
-    "sectionHyperlink": "section_link",
-    "snippet": "section_text_part",
-    "text": "section_text_part",
-    "content": "section_text_part",
-    "score": "score",
-    "rerank_score": "reranker_score",
-    "reranker_score": "reranker_score",
-    "citationIndex": "citation_index",
-    "citation_index": "citation_index",
-    "citationIndexs": "citation_indices",
-    "citationIndices": "citation_indices",
-    "page": "page",
-}
+class TachyonVS:
+    """Light wrapper around Tachyon Search endpoints."""
 
-def _derive_doc_name_from_link(url: str) -> str:
-    if not url:
-        return "Unknown Document"
-    try:
-        p = urlparse(url)
-        base = os.path.basename(p.path) or p.netloc or "Unknown Document"
-        return base
-    except Exception:
-        return "Unknown Document"
+    # ---------- PATCH START: payload builder + query ----------
 
-def _as_list(x):
-    if x is None or (isinstance(x, float) and pd.isna(x)):
-        return []
-    return x if isinstance(x, list) else [x]
+    @classmethod
+    def _build_payload(
+        cls,
+        query: str,
+        search_count: int = 10,
+        fields: Optional[List[str]] = None,
+        field_filter: Optional[Dict[str, Any]] = None,
+        search_type: str = "semantic",                   # "semantic" | "keyword" | "hybrid"
+        re_ranker: Optional[str] = None,                 # e.g., "semantic-ranker-512-003" / "RRF"
+    ) -> Dict[str, Any]:
+        """
+        Build a Tachyon payload that always asks for reference-friendly fields.
+        """
+        # Ask for reference fields explicitly; backend will ignore unknown ones.
+        fields = fields or [
+            # document-level identity
+            "title", "hyperlink",
+            # section identity
+            "sectionTitle", "sectionHyperlink",
+            # content / snippets
+            "content", "snippet", "text",
+            # citation/page-ish things
+            "page", "citationIndex", "citationIndexs",
+            # scoring
+            "score", "rerank_score", "reranker_score",
+        ]
 
-def _to_int_or_none(x):
-    try:
-        return int(x)
-    except Exception:
-        return None
+        if search_type == "hybrid" and not re_ranker:
+            # Hybrid must specify a re-ranker, otherwise results order is ambiguous.
+            raise ValueError("Re-Ranking algorithm must be specified for hybrid search.")
 
-def normalize_hits_df(hits: List[Dict[str, Any]]) -> pd.DataFrame:
-    df = pd.DataFrame(hits) if hits else pd.DataFrame()
-
-    # rename to canonical names
-    rename_cols = {k: v for k, v in _RENAME.items() if k in df.columns}
-    if rename_cols:
-        df = df.rename(columns=rename_cols)
-
-    # ensure required columns exist
-    for col in [
-        "document_name", "document_link", "section_name", "section_link",
-        "section_text_part", "page", "citation_index", "citation_indices",
-        "score", "reranker_score"
-    ]:
-        if col not in df.columns:
-            df[col] = None
-
-    # document name fallback from link
-    df["document_name"] = df["document_name"].fillna("").astype(str)
-    mask = df["document_name"].eq("") & df["document_link"].notna()
-    if mask.any():
-        df.loc[mask, "document_name"] = df.loc[mask, "document_link"].apply(_derive_doc_name_from_link)
-    df["document_name"] = df["document_name"].replace("", "Unknown Document")
-
-    # scores
-    df["score"] = pd.to_numeric(df["score"], errors="coerce").fillna(0.0)
-    df["reranker_score"] = pd.to_numeric(df["reranker_score"], errors="coerce")
-
-    # normalize citations
-    if "citation_indices" in df.columns:
-        df["citation_indices"] = df["citation_indices"].apply(_as_list)
-        df["citation_indices"] = df["citation_indices"].apply(
-            lambda xs: [y for y in (_to_int_or_none(x) for x in xs) if y is not None]
-        )
-    else:
-        df["citation_indices"] = [[] for _ in range(len(df))]
-
-    # infer page from citations if page is NaN
-    if "page" not in df.columns:
-        df["page"] = None
-    need_page = df["page"].isna() & df["citation_indices"].astype(bool)
-    if need_page.any():
-        df.loc[need_page, "page"] = df.loc[need_page, "citation_indices"].apply(lambda xs: xs[0] if xs else None)
-
-    # section name fallback
-    def best_section_name(row):
-        if row.get("section_name"):
-            return row["section_name"]
-        if pd.notna(row.get("page")):
-            return f"Page {int(row['page'])}"
-        txt = (row.get("section_text_part") or "").strip()
-        return (txt[:80] + "…") if txt else "Untitled Section"
-    df["section_name"] = df.apply(best_section_name, axis=1)
-
-    # compose reference
-    def make_ref(row):
-        base = row["document_name"] or "Unknown Document"
-        part = row.get("section_name") or "Section"
-        page = row.get("page")
-        if page is not None and page == page:
-            return f"{base} ▸ {part} (p.{int(page)})"
-        return f"{base} ▸ {part}"
-    df["reference"] = df.apply(make_ref, axis=1)
-
-    return df
-
-# -------------------------------------------------------------------
-# Building the final results structure used by your app
-# -------------------------------------------------------------------
-
-def build_results_from_df(df: pd.DataFrame) -> List[Dict[str, Any]]:
-    """
-    Turn the normalized DataFrame into your app's 'results' list.
-    Each item contains a doc-level object with a list of sections.
-    """
-    results: List[Dict[str, Any]] = []
-
-    if df.empty:
-        return results
-
-    for doc_name, group in df.groupby("document_name", dropna=False):
-        first = group.iloc[0]
-        doc = {
-            "document_name": first["document_name"],
-            "document_link": first.get("document_link") or "",
-            "document_score": float(group["score"].max()),
-            "document_sections": [],
+        payload: Dict[str, Any] = {
+            "query": (query or "").strip(),
+            "limit": int(search_count or 10),
+            "collectionId": getattr(getattr(Config, "tachyon"), "collection_id", None),
+            "search_type": search_type,        # server accepts "semantic" | "keyword" | "hybrid"
+            "reRanker": re_ranker,             # server will ignore if None
+            "fields": fields,
+            "filters": field_filter or None,
         }
+        # Remove empty keys (keeps payload clean in logs and avoids server-side defaults confusion)
+        payload = {k: v for k, v in payload.items() if v not in (None, "", [], {})}
+        return payload
 
-        for _, row in group.iterrows():
-            doc["document_sections"].append({
-                "section_name": row.get("section_name") or "",
-                "section_link": row.get("section_link") or "",
-                "section_text_part": row.get("section_text_part") or "",
-                "page": int(row["page"]) if pd.notna(row.get("page")) else None,
-                "citation_index": row.get("citation_index"),
-                "citation_indices": row.get("citation_indices") or [],
-                "score": float(row.get("score") or 0.0),
-                "reranker_score": row.get("reranker_score"),
-                "reference": row.get("reference") or "",
-            })
-        results.append(doc)
+    @classmethod
+    async def query(
+        cls,
+        query: str,
+        search_count: int = 10,
+        fields: Optional[List[str]] = None,
+        field_filter: Optional[Dict[str, Any]] = None,
+        search_type: str = "semantic",
+        re_ranker: Optional[str] = None,
+        search_initiator: Optional[str] = None,
+    ):
+        """
+        Run a Tachyon search. Supports semantic-only or hybrid+re-ranking.
+        """
+        url = getattr(getattr(Config, "tachyon"), "search_url", None)
+        timeout = getattr(getattr(Config, "tachyon"), "timeout", 30.0)
 
-    # sort documents by their best score (desc)
-    results.sort(key=lambda d: d.get("document_score", 0.0), reverse=True)
-    return results
+        if not url:
+            raise RuntimeError("Config.tachyon.search_url is not set")
 
-# -------------------------------------------------------------------
-# Example node that collects hits -> normalizes -> builds results
-# (use this inside your graph after vector search completes)
-# -------------------------------------------------------------------
+        payload = cls._build_payload(
+            query=query,
+            search_count=search_count,
+            fields=fields,
+            field_filter=field_filter,
+            search_type=search_type,
+            re_ranker=re_ranker,
+        )
 
-async def collect_search_results_node(state) -> Dict[str, Any]:
-    """
-    Expected `state.search_response` has an attribute `.hits` (list of dicts)
-    as returned by TachyonVS.query(...).
-    """
-    search_response = getattr(state, "search_response", None)
-    raw_hits = getattr(search_response, "hits", []) if search_response else []
+        headers = cls.get_headers(extra={"payload": json.dumps(payload), "initiator": (search_initiator or "")})
+        start_time = datetime.now(timezone.utc)
 
-    df = normalize_hits_df(raw_hits)
-    results = build_results_from_df(df)
+        # Make the request using your existing async helper
+        resp_json, initiator_used = await cls._make_async_request(url, json.dumps(payload), headers, timeout)
 
-    # store in state for downstream nodes / printing
-    state.results = results
-    state.results_df = df  # optional: keep the dataframe for debugging
+        # Helpful debug so you can confirm reranker usage in logs
+        try:
+            logger.debug(
+                "tachyon.search response",
+                extra={
+                    "status_code": resp_json.get("status_code", 200),
+                    "count": len(resp_json.get("result", {}).get("hits", [])),
+                    "search_type": search_type,
+                    "reRanker": re_ranker or "omitted_none",
+                },
+            )
+        except Exception:
+            pass
 
-    return {"results": results}
+        # Convert to your SearchResults type using the existing helper
+        return cls._as_search_results(
+            resp_json,
+            headers=headers,
+            status_code=resp_json.get("status_code", 200),
+            start_time=start_time,
+            search_initiator=initiator_used,
+        )
 
-# -------------------------------------------------------------------
-# Helper: pretty print first section reference of each document
-# -------------------------------------------------------------------
-
-def print_top_references(results: List[Dict[str, Any]]) -> None:
-    for i, doc in enumerate(results, 1):
-        sec = (doc.get("document_sections") or [{}])[0]
-        ref = sec.get("reference") or f"{doc.get('document_name','Unknown Document')} ▸ {sec.get('section_name','Section')}"
-        print(f"{i}. {ref}")
+    # ---------- PATCH END ----------
